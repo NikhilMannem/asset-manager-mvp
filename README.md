@@ -123,9 +123,3 @@ All routes except `/tenants` require an `x-tenant-id` header.
 | PATCH | `/assets/:id` | Update an asset |
 | DELETE | `/assets/:id` | Delete an asset |
 | POST | `/seed-data` | Insert sample staged data |
-
-## Limitations and next steps
-
-- The tenant is taken from the `x-tenant-id` header. A production version would derive it from an authenticated session or JWT, so a client cannot choose its tenant.
-- An upload runs as a single transaction, so a failure rolls back the whole file. Very large imports could commit per batch with resumable progress.
-- Add automated integration tests for the isolation checks above.
