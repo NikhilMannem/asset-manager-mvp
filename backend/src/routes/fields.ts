@@ -53,13 +53,28 @@ router.post("/fields", async (req, res) => {
 });
 router.get("/fields", async (req, res) => {
   const tenantId = req.header("x-tenant-id");
+
+  if (!tenantId) {
+    return res.status(400).json({ error: "Missing tenant id" });
+  }
+
   const client = await pool.connect();
   try {
+    // asset_fields is protected by RLS, so the tenant context must be set.
+    await client.query("BEGIN");
+    await client.query(
+      "SELECT set_config('app.current_tenant', $1, true)",
+      [tenantId]
+    );
     const result = await client.query(
       "SELECT name, type, required FROM asset_fields WHERE tenant_id = $1",
       [tenantId]
     );
+    await client.query("COMMIT");
     res.json(result.rows);
+  } catch (err: any) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
