@@ -1,16 +1,10 @@
 import { Router } from "express";
-import { type Request } from "express";
 import multer from "multer";
 import fs from "fs";
 import csv from "csv-parser";
-import * as z from "zod";
 import { pool } from "../db.js";
 import { type PoolClient } from "pg";
 import { getDynamicSchema } from "../utils/schemaBuilder.js";
-
-type MulterRequest = Request & {
-  file: Express.Multer.File;
-};
 
 const router = Router();
 
@@ -27,139 +21,231 @@ router.post("/upload", upload.single("file"), async (req, res) => {
   const tenantId = req.header("x-tenant-id");
 
   if (!tenantId) {
-    return res.status(400).json({ error: "Missing tenant header" });
+    return res.status(400).json({
+      error: "Missing tenant header",
+    });
   }
 
   if (!req.file) {
-    return res.status(400).json({ error: "No file uploaded" });
+    return res.status(400).json({
+      error: "No file uploaded",
+    });
   }
 
-  // 1. Grab the client
   const client = await pool.connect();
 
-  let dynamicschema;
   try {
-    // Generate the dynamic schema from the database BEFORE the main transaction
-    dynamicschema = await getDynamicSchema(client, tenantId);
-  } catch (err: any) {
-    client.release();
-    // Clean up temp file on early exit
-    if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
-    return res.status(400).json({ error: err.message });
-  }
-
-  // 2. Start the master try/catch block
-  try {
+    /*
+     * 1. Start transaction
+     */
     await client.query("BEGIN");
+
+    /*
+     * 2. Set tenant context for PostgreSQL RLS
+     */
     await client.query(
       "SELECT set_config('app.current_tenant', $1, true)",
       [tenantId]
     );
 
-    const stream = fs.createReadStream(req.file.path).pipe(csv());
+    /*
+     * 3. Load the tenant-specific Zod schema
+     */
+    const dynamicSchema = await getDynamicSchema(
+      client,
+      tenantId
+    );
+
+    /*
+     * 4. Get the allowed CSV column names
+     */
+    const allowedFields = Object.keys(
+      dynamicSchema.shape
+    );
+
+    const stream = fs
+      .createReadStream(req.file.path)
+      .pipe(csv());
 
     let batch: any[] = [];
     let validCount = 0;
     let invalidCount = 0;
 
-    // Extract allowed keys directly from the Zod schema shape
-    const allowedFields = Object.keys(dynamicschema.shape);
-
-    // Process the stream
+    /*
+     * 5. Process the CSV as a stream
+     */
     for await (const row of stream) {
+      /*
+       * Keep only configured fields.
+       *
+       * Example:
+       * Configured fields: name, price, color
+       *
+       * CSV columns:
+       * name, price, color, randomColumn
+       *
+       * randomColumn will be ignored.
+       */
+      const cleanedRow: Record<string, unknown> = {};
 
-      // 🔽 STEP 3.3 — CLEAN ROW (only allowed fields)
-      const cleanedRow: any = {};
       for (const key of Object.keys(row)) {
         if (allowedFields.includes(key)) {
           cleanedRow[key] = row[key];
         }
       }
 
-      // 🔽 STEP 3.4 — VALIDATE using dynamic schema
-      const result = dynamicschema.safeParse(cleanedRow);
+      /*
+       * 6. Validate the cleaned row using the dynamic schema
+       */
+      const result = dynamicSchema.safeParse(cleanedRow);
 
-      // 🔽 STEP 3.5 — PREPARE FOR INSERT
+      /*
+       * 7. Store both original/cleaned data and normalized data
+       */
       batch.push({
         row: cleanedRow,
+
         valid: result.success,
-        errors: result.success ? null : result.error.issues,
+
+        errors: result.success
+          ? null
+          : result.error.issues,
+
+        validatedData: result.success
+          ? result.data
+          : null,
       });
 
-      if (result.success) validCount++;
-      else invalidCount++;
+      if (result.success) {
+        validCount++;
+      } else {
+        invalidCount++;
+      }
 
-      // 🔽 batch insert (unchanged)
+      /*
+       * 8. Insert in batches of 500
+       */
       if (batch.length === 500) {
         await insertBatch(client, tenantId, batch);
         batch = [];
       }
     }
 
-    // Insert any remaining rows
+    /*
+     * 9. Insert remaining rows
+     */
     if (batch.length > 0) {
       await insertBatch(client, tenantId, batch);
     }
 
+    /*
+     * 10. Commit transaction
+     */
     await client.query("COMMIT");
 
-    // Clean up: Delete the temp file to save disk space
+    /*
+     * 11. Delete temporary uploaded file
+     */
     fs.unlink(req.file.path, (err) => {
-      if (err) console.error("Failed to delete temp file:", err);
+      if (err) {
+        console.error(
+          "Failed to delete temp file:",
+          err
+        );
+      }
     });
 
-    // Send single success response
-    res.json({
+    /*
+     * 12. Send response
+     */
+    return res.json({
       message: "Upload complete",
       validCount,
       invalidCount,
     });
-
   } catch (err) {
     console.error("FULL ERROR:", err);
-    
-    // Rollback changes if anything goes wrong
-    await client.query("ROLLBACK");
 
-    // Clean up temp file on error as well
-    if (req.file && req.file.path) {
-      fs.unlink(req.file.path, () => {}); 
+    /*
+     * Roll back database changes
+     */
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error(
+        "Rollback failed:",
+        rollbackError
+      );
     }
 
-    // Now Postman will actually receive the exact database error
-    res.status(500).json({
-      error: "Upload failed",
-      details: err instanceof Error ? err.message : String(err)
-    });
+    /*
+     * Delete temporary file on failure
+     */
+    if (req.file && req.file.path) {
+      fs.unlink(req.file.path, () => {});
+    }
 
+    return res.status(500).json({
+      error: "Upload failed",
+      details:
+        err instanceof Error
+          ? err.message
+          : String(err),
+    });
   } finally {
-    // 3. CRITICAL: Always release the client back to the pool
     client.release();
   }
 });
 
-async function insertBatch(client: PoolClient, tenantId: string, batch: any[]) {
+/*
+ * Inserts staged rows in bulk.
+ */
+async function insertBatch(
+  client: PoolClient,
+  tenantId: string,
+  batch: any[]
+) {
   const values: any[] = [];
   const placeholders: string[] = [];
 
   batch.forEach((item: any, i: number) => {
-    const idx = i * 4;
+    const idx = i * 5;
 
     placeholders.push(
-      `($${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4})`
+      `($${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5})`
     );
 
     values.push(
       tenantId,
+
+      // Original cleaned CSV values
       JSON.stringify(item.row),
-      JSON.stringify(item.errors),
-      item.valid
+
+      // Validation errors, if any
+      item.errors
+        ? JSON.stringify(item.errors)
+        : null,
+
+      // true or false
+      item.valid,
+
+      // Zod-normalized data
+      item.validatedData
+        ? JSON.stringify(item.validatedData)
+        : null
     );
   });
 
   await client.query(
     `
-    INSERT INTO staged_assets (tenant_id, raw_data, errors, is_valid)
+    INSERT INTO staged_assets
+      (
+        tenant_id,
+        raw_data,
+        errors,
+        is_valid,
+        validated_data
+      )
     VALUES ${placeholders.join(",")}
     `,
     values
